@@ -13,38 +13,39 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 warnings.filterwarnings("ignore", message="urllib3")
 
-# Настройка логирования
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Загрузка .env
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 
 if not TELEGRAM_BOT_TOKEN or not SPREADSHEET_ID:
-    raise ValueError("Не найдены необходимые переменные окружения: TELEGRAM_BOT_TOKEN или SPREADSHEET_ID")
+    raise ValueError("Не найдены необходимые переменные окружения")
 
 class LeadBot:
     def __init__(self):
         self.spreadsheet = self.connect_to_google_sheets()
         self.user_tabs = {
-            "SALIQ_008": "Технопос",
-            "Abdukhafizov95": "Самарканд",
+            "saliq_008": "Технопос",
+            "abdukhafizov95": "Самарканд",
             "aqly_office": "Хорезм",
             "aqly_uz": "Хорезм",
-            "Aqly_hr": "Хорезм",
+            "aqly_hr": "Хорезм",
             "utkirraimov": "Джиззак",
             "bob_7007": "Джиззак",
             "user1": "Термез",
             "user2": "Ташкент",
-            "user3":"Бухара"
+            "user3": "Бухара",
+            "ravshan_billz": "All"
         }
-        self.unconfirmed_leads: Dict[int, Dict[str, Any]] = {}
+        self.unconfirmed_leads: Dict[str, Dict[str, Any]] = {}
+        self.lead_timers: Dict[str, asyncio.Task] = {}
+        self.waiting_confirmation: Dict[int, str] = {}  # chat_id -> username
 
     @staticmethod
     def connect_to_google_sheets():
@@ -81,41 +82,126 @@ class LeadBot:
             logger.error(f"Ошибка при добавлении данных в таблицу: {e}")
             return False
 
+    async def send_reminder(self, chat_id: int, username: str, attempt: int):
+        """Отправка напоминания пользователю."""
+        try:
+            message = (
+                f"❗ Напоминание для @{username}. Подтвердите получение лида.\n"
+                f"Попытка {attempt}/3"
+            )
+            await self.application.bot.send_message(chat_id=chat_id, text=message)
+        except Exception as e:
+            logger.error(f"Ошибка при отправке напоминания: {e}")
+
+    async def handle_confirmation(self, chat_id: int, username: str):
+        """Обработка подтверждения получения лида."""
+        if chat_id in self.waiting_confirmation:
+            # Отменяем все существующие таймеры для этого чата
+            for lead_key in list(self.lead_timers.keys()):
+                if lead_key.startswith(f"{chat_id}:"):
+                    if self.lead_timers[lead_key]:
+                        self.lead_timers[lead_key].cancel()
+                    del self.lead_timers[lead_key]
+
+            # Очищаем информацию о неподтвержденных лидах
+            for lead_key in list(self.unconfirmed_leads.keys()):
+                if lead_key.startswith(f"{chat_id}:"):
+                    del self.unconfirmed_leads[lead_key]
+
+            # Удаляем из ожидающих подтверждения
+            del self.waiting_confirmation[chat_id]
+
+            # Отправляем позитивное сообщение с инструкциями
+            success_message = (
+                f"✅ Спасибо, @{username}! Лид успешно принят!\n\n"
+                "🔍 Пожалуйста:\n"
+                "1️⃣ Проверьте и заполните все необходимые поля в AmoCRM\n"
+                "2️⃣ Установите корректную стадию сделки\n"
+                "3️⃣ Следуйте этапам воронки продаж\n\n"
+                "💪 Удачи в работе с клиентом!"
+            )
+            await self.application.bot.send_message(chat_id=chat_id, text=success_message)
+            return True
+        return False
+
+    async def start_lead_timer(self, chat_id: int, message_id: int, username: str):
+        """Запуск таймера для отслеживания подтверждения лида."""
+        lead_key = f"{chat_id}:{message_id}"
+        
+        # Первое напоминание через 2 минуты
+        await asyncio.sleep(120)
+        if lead_key in self.unconfirmed_leads:
+            await self.send_reminder(chat_id, username, 1)
+            
+            # Второе напоминание через 3 минуты
+            await asyncio.sleep(180)
+            if lead_key in self.unconfirmed_leads:
+                await self.send_reminder(chat_id, username, 2)
+                
+                # Третье напоминание через 3 минуты
+                await asyncio.sleep(180)
+                if lead_key in self.unconfirmed_leads:
+                    await self.send_reminder(chat_id, username, 3)
+                    
+                    # Финальное ожидание 3 минуты перед удалением
+                    await asyncio.sleep(180)
+                    if lead_key in self.unconfirmed_leads:
+                        # Очищаем все данные о лиде
+                        del self.unconfirmed_leads[lead_key]
+                        if chat_id in self.waiting_confirmation:
+                            del self.waiting_confirmation[chat_id]
+                        await self.application.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ Лид для @{username} удален из системы, так как не был подтвержден."
+                        )
+
     async def handle_message(self, update: Update, context):
         try:
-            message_text = update.message.text
-            sender = update.message.from_user.username
-            chat_id = update.message.chat_id
+            message = update.message
+            chat_id = message.chat_id
+            message_id = message.message_id
+            message_text = message.text.lower() if message.text else ""
+            sender_username = message.from_user.username
 
-            if message_text.lower() in ["принял", "ок, спасибо", "ок", "спасибо"]:
-                for msg_id, lead_info in list(self.unconfirmed_leads.items()):
-                    if lead_info["assigned_to"] == sender:
-                        del self.unconfirmed_leads[msg_id]
-                        await update.message.reply_text(
-                            f"✅ @{sender}, спасибо за подтверждение!"
+            # Проверяем подтверждение получения лида
+            if message_text in ["принял", "ок", "спасибо", "ок, спасибо", "оке", "oke"]:
+                if chat_id in self.waiting_confirmation:
+                    username = self.waiting_confirmation[chat_id]
+                    await self.handle_confirmation(chat_id, username)
+                    return
+
+            # Проверяем наличие @username и ссылки AmoCRM
+            if "@" in message_text:
+                username = message_text.split("@")[1].split()[0].strip()
+                amo_link = next((word for word in message_text.split() 
+                               if "amocrm.ru/leads/detail/" in word 
+                               or "billz.amocrm.ru" in word), None)
+                
+                if amo_link and username:
+                    if self.add_lead_to_sheet(username, message_text, amo_link):
+                        sent_message = await message.reply_text(
+                            f"📨 Лид передан для @{username}!\n\n"
+                            "❗️ Пожалуйста, подтвердите получение лида."
                         )
-                        return
+                        
+                        lead_key = f"{chat_id}:{sent_message.message_id}"
+                        self.unconfirmed_leads[lead_key] = {
+                            "assigned_to": username,
+                            "amo_link": amo_link
+                        }
+                        
+                        # Сохраняем информацию об ожидании подтверждения
+                        self.waiting_confirmation[chat_id] = username
+                        
+                        # Запускаем таймер для отслеживания подтверждения
+                        self.lead_timers[lead_key] = asyncio.create_task(
+                            self.start_lead_timer(chat_id, sent_message.message_id, username)
+                        )
+                    else:
+                        await message.reply_text("❌ Ошибка при сохранении данных.")
 
-            if "@" in message_text and "amocrm.ru/leads/detail/" in message_text:
-                username = message_text.split("@")[1].split()[0]
-                amo_link = next((word for word in message_text.split() if "amocrm.ru/leads/detail/" in word), "")
-                if self.add_lead_to_sheet(username, message_text, amo_link):
-                    sent_message = await update.message.reply_text(
-                        f"📨 Лид передан для @{username}!\n\n"
-                        "❗️ Пожалуйста, подтвердите получение лида."
-                    )
-                    self.unconfirmed_leads[sent_message.message_id] = {
-                        "assigned_to": username,
-                        "amo_link": amo_link
-                    }
-                else:
-                    await update.message.reply_text("❌ Ошибка при сохранении данных.")
-            else:
-                await update.message.reply_text("⚠️ Неверный формат сообщения.")
-        except TelegramError as e:
-            logger.error(f"Ошибка Telegram: {e}")
         except Exception as e:
-            logger.error(f"Неожиданная ошибка: {e}")
+            logger.error(f"Ошибка при обработке сообщения: {e}")
 
     async def start_command(self, update: Update, context):
         await update.message.reply_text(
@@ -124,11 +210,11 @@ class LeadBot:
         )
 
     def run(self):
-        application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-        application.add_handler(CommandHandler("start", self.start_command))
-        application.add_handler(MessageHandler(filters.TEXT, self.handle_message))
+        self.application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(MessageHandler(filters.TEXT, self.handle_message))
         logger.info("🚀 Бот запущен...")
-        application.run_polling()
+        self.application.run_polling()
 
 if __name__ == "__main__":
     bot = LeadBot()
