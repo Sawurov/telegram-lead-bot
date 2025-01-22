@@ -164,7 +164,7 @@ class LeadBot:
             sender_username = message.from_user.username
 
             # Проверяем подтверждение получения лида
-            if message_text in ["принял", "ок", "спасибо", "ок, спасибо", "оке", "oke"]:
+            if message_text in ["принял", "ок", "OK", "Ок", "OK", "спасибо", "ок, спасибо", "оке", "ok", "Ok"  "oke"]:
                 if chat_id in self.waiting_confirmation:
                     username = self.waiting_confirmation[chat_id]
                     await self.handle_confirmation(chat_id, username)
@@ -181,7 +181,7 @@ class LeadBot:
                     if self.add_lead_to_sheet(username, message_text, amo_link):
                         sent_message = await message.reply_text(
                             f"📨 Лид передан для @{username}!\n\n"
-                            "❗️ Пожалуйста, подтвердите получение лида."
+                            "❗️ Пожалуйста, подтвердите получение лида.(Можно написать в ответь 'ок', 'ok')"
                         )
                         
                         lead_key = f"{chat_id}:{sent_message.message_id}"
