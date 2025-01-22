@@ -38,8 +38,8 @@ class LeadBot:
             "aqly_hr": "Хорезм",
             "utkirraimov": "Джиззак",
             "bob_7007": "Джиззак",
-            "user1": "Термез",
-            "user2": "Ташкент",
+            "farhod_developer": "Термез",
+            "shoxjaxon055": "Ташкент",
             "user3": "Бухара",
             "ravshan_billz": "All"
         }
