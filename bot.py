@@ -26,15 +26,21 @@ logger = logging.getLogger(__name__)
 # Загружаем переменные окружения
 load_dotenv()
 
+import os
+import json
+import gspread
+from google.oauth2.service_account import Credentials
+
 class Config:
+    """production config"""
     """Конфигурация для загрузки и проверки данных"""
     def __init__(self):
         self.TELEGRAM_BOT_TOKEN = self._get_env("TELEGRAM_BOT_TOKEN")
         self.SPREADSHEET_ID = self._get_env("SPREADSHEET_ID")
-        
-        # Загружаем учетные данные Google как JSON-строку и преобразуем в словарь
-        google_creds_json = self._get_env("GOOGLE_CREDENTIALS")
-        self.GOOGLE_CREDS = json.loads(google_creds_json)
+
+        google_creds_path = "/etc/secrets/service_account.json"  
+        with open(google_creds_path, "r") as file:
+            self.GOOGLE_CREDS = json.load(file)
 
         # Исправляем формат приватного ключа
         self.GOOGLE_CREDS["private_key"] = self.GOOGLE_CREDS["private_key"].replace("\\n", "\n")
@@ -60,6 +66,13 @@ class Config:
 
         if "-----BEGIN PRIVATE KEY-----" not in self.GOOGLE_CREDS["private_key"]:
             raise ValueError("Неверный формат приватного ключа")
+
+# Функция подключения к Google Sheets
+def connect_to_google_sheets():
+    config = Config()
+    creds = Credentials.from_service_account_info(config.GOOGLE_CREDS)
+    client = gspread.authorize(creds)
+    return client
 
 class GoogleSheetsManager:
     """Класс для работы с Google Sheets"""
@@ -143,7 +156,6 @@ class LeadBot:
         self.lead_timers: Dict[str, asyncio.Task] = {}
         self.waiting_confirmation: Dict[int, str] = {}
         self.application = None
-        self.loop = None  # Добавляем атрибут для хранения event loop
         
         # Шаблоны сообщений
         self.messages = {
@@ -290,15 +302,8 @@ class LeadBot:
 
     def run(self):
         """Запуск бота с обработкой ошибок и логикой переподключения"""
-        # Инициализация event loop
-        try:
-            self.loop = asyncio.get_event_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-
         # Проверяем подключение к Google Sheets перед запуском
-        if not self.loop.run_until_complete(self.check_google_connection()):
+        if not asyncio.run(self.check_google_connection()):
             logger.critical("Не удалось подключиться к Google Sheets. Выход.")
             sys.exit(1)
 
@@ -325,7 +330,7 @@ class LeadBot:
                 # Регистрируем обработчик завершения
                 self.application.post_shutdown = self.shutdown
                 
-                # Запускаем бота с использованием существующего loop
+                # Запускаем бота
                 self.application.run_polling(close_loop=False)
             except Exception as e:
                 logger.error(f"Бот упал с ошибкой: {e}")
