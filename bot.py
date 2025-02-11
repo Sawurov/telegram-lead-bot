@@ -1,35 +1,131 @@
 import os
+import sys
+import json
 import logging
 import gspread
 import warnings
 import asyncio
+import re
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 from telegram import Update
 from telegram.error import TelegramError
-from typing import Dict, Any
-from oauth2client.service_account import ServiceAccountCredentials
+from typing import Dict, Any, Optional
+from flask import Flask
+from threading import Thread
 
-warnings.filterwarnings("ignore", message="urllib3")
-
+# Настройка логирования
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Загружаем переменные окружения
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+class Config:
+    """Конфигурация для загрузки и проверки данных"""
+    def __init__(self):
+        self.TELEGRAM_BOT_TOKEN = self._get_env("TELEGRAM_BOT_TOKEN")
+        self.SPREADSHEET_ID = self._get_env("SPREADSHEET_ID")
+        
+        # Загружаем учетные данные Google как JSON-строку и преобразуем в словарь
+        google_creds_json = self._get_env("GOOGLE_CREDENTIALS")
+        self.GOOGLE_CREDS = json.loads(google_creds_json)
 
-if not TELEGRAM_BOT_TOKEN or not SPREADSHEET_ID:
-    raise ValueError("Не найдены необходимые переменные окружения")
+        # Исправляем формат приватного ключа
+        self.GOOGLE_CREDS["private_key"] = self.GOOGLE_CREDS["private_key"].replace("\\n", "\n")
+
+        self.PORT = int(os.getenv("PORT", 8080))
+        self._validate_google_creds()
+
+    def _get_env(self, key: str, default: Optional[str] = None) -> str:
+        value = os.getenv(key, default)
+        if value is None:
+            raise ValueError(f"Отсутствует переменная окружения: {key}")
+        return value
+
+    def _validate_google_creds(self):
+        """Проверка учетных данных Google"""
+        required_keys = [
+            "type", "project_id", "private_key_id",
+            "private_key", "client_email", "client_id"
+        ]
+        for key in required_keys:
+            if not self.GOOGLE_CREDS.get(key):
+                raise ValueError(f"Отсутствует обязательный ключ в Google Credentials: {key}")
+
+        if "-----BEGIN PRIVATE KEY-----" not in self.GOOGLE_CREDS["private_key"]:
+            raise ValueError("Неверный формат приватного ключа")
+
+class GoogleSheetsManager:
+    """Класс для работы с Google Sheets"""
+    def __init__(self, config: Config):
+        self.config = config
+        self._client = None
+        self._spreadsheet = None
+        self._retry_count = 0
+        self._max_retries = 3
+        self._backoff_base = 1.5  # База для экспоненциального бэкоффа
+        
+    @property
+    def client(self):
+        """Ленивая инициализация Google Sheets клиента с повторными попытками"""
+        if self._client is None:
+            for attempt in range(1, self._max_retries + 1):
+                try:
+                    logger.info(f"Попытка аутентификации Google (попытка {attempt})")
+                    self._client = gspread.service_account_from_dict(self.config.GOOGLE_CREDS)
+                    # Тестируем подключение
+                    self._client.openall()
+                    logger.info("Аутентификация Google Sheets успешна")
+                    return self._client
+                except Exception as e:
+                    logger.error(f"Аутентификация не удалась: {str(e)}")
+                    if attempt == self._max_retries:
+                        raise
+                    sleep_time = self._backoff_base ** attempt
+                    time.sleep(sleep_time)
+        return self._client
+    
+    @property
+    def spreadsheet(self):
+        """Ленивая загрузка Google Таблицы с повторными попытками"""
+        if self._spreadsheet is None:
+            while self._retry_count < self._max_retries:
+                try:
+                    self._spreadsheet = self.client.open_by_key(self.config.SPREADSHEET_ID)
+                    self._retry_count = 0  # Сброс счетчика после успешного подключения
+                    break
+                except Exception as e:
+                    self._retry_count += 1
+                    logger.error(f"Ошибка доступа к Google Таблице (попытка {self._retry_count}): {e}")
+                    if self._retry_count >= self._max_retries:
+                        raise
+                    time.sleep(2 ** self._retry_count)
+        return self._spreadsheet
+
+    async def append_lead(self, worksheet_name: str, data: list) -> bool:
+        """Добавление данных в таблицу с улучшенной обработкой ошибок"""
+        try:
+            worksheet = self.spreadsheet.worksheet(worksheet_name)
+            worksheet.append_row(data)
+            logger.info(f"Данные успешно добавлены в {worksheet_name}")
+            return True
+        except gspread.exceptions.APIError as e:
+            logger.error(f"Ошибка API Google: {e.response.text}")
+            return False
+        except Exception as e:
+            logger.error(f"Непредвиденная ошибка append_lead: {str(e)}")
+            return False
 
 class LeadBot:
-    def __init__(self):
-        self.spreadsheet = self.connect_to_google_sheets()
+    def __init__(self, config: Config, sheets_manager: GoogleSheetsManager):
+        self.config = config
+        self.sheets = sheets_manager
         self.user_tabs = {
             "saliq_008": "Технопос",
             "abdukhafizov95": "Самарканд",
@@ -45,177 +141,224 @@ class LeadBot:
         }
         self.unconfirmed_leads: Dict[str, Dict[str, Any]] = {}
         self.lead_timers: Dict[str, asyncio.Task] = {}
-        self.waiting_confirmation: Dict[int, str] = {}  # chat_id -> username
-
-    @staticmethod
-    def connect_to_google_sheets():
-        try:
-            credentials = {
-                "type": os.getenv("TYPE"),
-                "project_id": os.getenv("PROJECT_ID"),
-                "private_key_id": os.getenv("PRIVATE_KEY_ID"),
-                "private_key": os.getenv("PRIVATE_KEY", "").replace("\\n", "\n"),
-                "client_email": os.getenv("CLIENT_EMAIL"),
-                "client_id": os.getenv("CLIENT_ID"),
-                "auth_uri": os.getenv("AUTH_URI"),
-                "token_uri": os.getenv("TOKEN_URI"),
-                "auth_provider_x509_cert_url": os.getenv("AUTH_PROVIDER_CERT_URL"),
-                "client_x509_cert_url": os.getenv("CLIENT_CERT_URL"),
-            }
-            client = gspread.service_account_from_dict(credentials)
-            return client.open_by_key(SPREADSHEET_ID)
-        except Exception as e:
-            logger.error(f"Ошибка при подключении к Google Sheets: {e}")
-            raise
-
-    def add_lead_to_sheet(self, username: str, message_text: str, user_link: str) -> bool:
-        try:
-            if username not in self.user_tabs:
-                logger.warning(f"Вкладка для пользователя @{username} не найдена")
-                return False
-
-            worksheet = self.spreadsheet.worksheet(self.user_tabs[username])
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            worksheet.append_row([current_time, message_text, user_link])
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка при добавлении данных в таблицу: {e}")
-            return False
-
-    async def send_reminder(self, chat_id: int, username: str, attempt: int):
-        """Отправка напоминания пользователю."""
-        try:
-            message = (
-                f"❗ Напоминание для @{username}. Подтвердите получение лида.\n"
-                f"Попытка {attempt}/3"
-            )
-            await self.application.bot.send_message(chat_id=chat_id, text=message)
-        except Exception as e:
-            logger.error(f"Ошибка при отправке напоминания: {e}")
-
-    async def handle_confirmation(self, chat_id: int, username: str):
-        """Обработка подтверждения получения лида."""
-        if chat_id in self.waiting_confirmation:
-            # Отменяем все существующие таймеры для этого чата
-            for lead_key in list(self.lead_timers.keys()):
-                if lead_key.startswith(f"{chat_id}:"):
-                    if self.lead_timers[lead_key]:
-                        self.lead_timers[lead_key].cancel()
-                    del self.lead_timers[lead_key]
-
-            # Очищаем информацию о неподтвержденных лидах
-            for lead_key in list(self.unconfirmed_leads.keys()):
-                if lead_key.startswith(f"{chat_id}:"):
-                    del self.unconfirmed_leads[lead_key]
-
-            # Удаляем из ожидающих подтверждения
-            del self.waiting_confirmation[chat_id]
-
-            # Отправляем позитивное сообщение с инструкциями
-            success_message = (
-                f"✅ Спасибо, @{username}! Лид успешно принят!\n\n"
+        self.waiting_confirmation: Dict[int, str] = {}
+        self.application = None
+        self.loop = None  # Добавляем атрибут для хранения event loop
+        
+        # Шаблоны сообщений
+        self.messages = {
+            'start': "👋 Добро пожаловать!\nОтправьте сообщение с упоминанием пользователя и ссылкой на сделку.",
+            'lead_success': "📨 Лид передан для @{username}!\n\n❗️ Пожалуйста, подтвердите получение лида (можно ответить 'ок' или 'принял')",
+            'reminder': "❗ Напоминание для @{username}. Подтвердите получение лида.\nПопытка {attempt}/3",
+            'confirmation_success': (
+                "✅ Спасибо, @{username}! Лид успешно принят!\n\n"
                 "🔍 Пожалуйста:\n"
                 "1️⃣ Проверьте и заполните все необходимые поля в AmoCRM\n"
                 "2️⃣ Установите корректную стадию сделки\n"
                 "3️⃣ Следуйте этапам воронки продаж\n\n"
                 "💪 Удачи в работе с клиентом!"
-            )
-            await self.application.bot.send_message(chat_id=chat_id, text=success_message)
+            ),
+            'lead_expired': "❌ Лид для @{username} удален из системы, так как не был подтвержден.",
+            'error': "⚠️ Произошла ошибка при обработке лида. Пожалуйста, попробуйте еще раз позже."
+        }
+
+    async def check_google_connection(self):
+        """Проверка подключения к Google Sheets"""
+        try:
+            test_sheet = self.sheets.spreadsheet
+            worksheet = test_sheet.worksheet("All")
+            worksheet.append_row(["Connection Test", datetime.now().isoformat()])
+            logger.info("Тест подключения к Google Sheets успешен")
             return True
-        return False
+        except Exception as e:
+            logger.error(f"Тест подключения к Google Sheets не удался: {e}")
+            return False
+
+    async def send_reminder(self, chat_id: int, username: str, attempt: int):
+        """Отправка напоминания с обработкой ошибок"""
+        try:
+            message = self.messages['reminder'].format(username=username, attempt=attempt)
+            await self.application.bot.send_message(chat_id=chat_id, text=message)
+        except TelegramError as e:
+            logger.error(f"Ошибка отправки напоминания: {e}")
+
+    async def handle_confirmation(self, chat_id: int, username: str):
+        """Обработка подтверждения лида"""
+        if chat_id not in self.waiting_confirmation:
+            return False
+
+        # Отменяем все таймеры для этого чата
+        for lead_key in list(self.lead_timers.keys()):
+            if lead_key.startswith(f"{chat_id}:"):
+                self.lead_timers[lead_key].cancel()
+                del self.lead_timers[lead_key]
+
+        # Очищаем данные
+        for lead_key in list(self.unconfirmed_leads.keys()):
+            if lead_key.startswith(f"{chat_id}:"):
+                del self.unconfirmed_leads[lead_key]
+
+        del self.waiting_confirmation[chat_id]
+
+        await self.application.bot.send_message(
+            chat_id=chat_id,
+            text=self.messages['confirmation_success'].format(username=username)
+        )
+        return True
 
     async def start_lead_timer(self, chat_id: int, message_id: int, username: str):
-        """Запуск таймера для отслеживания подтверждения лида."""
+        """Запуск таймера подтверждения лида"""
         lead_key = f"{chat_id}:{message_id}"
+        reminder_intervals = [120, 180, 180, 180]  # Интервалы в секундах
         
-        # Первое напоминание через 2 минуты
-        await asyncio.sleep(120)
-        if lead_key in self.unconfirmed_leads:
-            await self.send_reminder(chat_id, username, 1)
-            
-            # Второе напоминание через 3 минуты
-            await asyncio.sleep(180)
-            if lead_key in self.unconfirmed_leads:
-                await self.send_reminder(chat_id, username, 2)
+        for attempt, delay in enumerate(reminder_intervals, 1):
+            await asyncio.sleep(delay)
+            if lead_key not in self.unconfirmed_leads:
+                return
                 
-                # Третье напоминание через 3 минуты
-                await asyncio.sleep(180)
-                if lead_key in self.unconfirmed_leads:
-                    await self.send_reminder(chat_id, username, 3)
-                    
-                    # Финальное ожидание 3 минуты перед удалением
-                    await asyncio.sleep(180)
-                    if lead_key in self.unconfirmed_leads:
-                        # Очищаем все данные о лиде
-                        del self.unconfirmed_leads[lead_key]
-                        if chat_id in self.waiting_confirmation:
-                            del self.waiting_confirmation[chat_id]
-                        await self.application.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"❌ Лид для @{username} удален из системы, так как не был подтвержден."
-                        )
+            if attempt <= 3:
+                await self.send_reminder(chat_id, username, attempt)
+            else:
+                del self.unconfirmed_leads[lead_key]
+                if chat_id in self.waiting_confirmation:
+                    del self.waiting_confirmation[chat_id]
+                await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=self.messages['lead_expired'].format(username=username)
+                )
+                return
 
     async def handle_message(self, update: Update, context):
+        """Обработка входящих сообщений"""
         try:
             message = update.message
-            chat_id = message.chat_id
-            message_id = message.message_id
-            message_text = message.text.lower() if message.text else ""
-            sender_username = message.from_user.username
+            logger.info(f"Получено сообщение: {message.text}")
+            
+            if not message or not message.text:
+                logger.warning("Получено пустое сообщение")
+                return
 
-            # Проверяем подтверждение получения лида
-            if message_text in ["принял", "ок", "OK", "Ок", "OK", "спасибо", "ок, спасибо", "оке", "ok", "Ok"  "oke"]:
-                if chat_id in self.waiting_confirmation:
-                    username = self.waiting_confirmation[chat_id]
-                    await self.handle_confirmation(chat_id, username)
+            # Проверка на подтверждение
+            if re.search(r'^(ок|принял|спасибо|ok|oke?)$', message.text, re.I):
+                if await self.handle_confirmation(message.chat_id, message.from_user.username):
                     return
 
-            # Проверяем наличие @username и ссылки AmoCRM
-            if "@" in message_text:
-                username = message_text.split("@")[1].split()[0].strip()
-                amo_link = next((word for word in message_text.split() 
-                               if "amocrm.ru/leads/detail/" in word 
-                               or "billz.amocrm.ru" in word), None)
+            # Поиск лида с улучшенным сопоставлением шаблонов
+            logger.info("Пытаемся найти совпадение в сообщении")
+            match = re.search(r'(?:@(\w+).*?(https?://[^\s]+amocrm\.ru[^\s]*))|(?:(https?://[^\s]+amocrm\.ru[^\s]*).*?@(\w+))', message.text)
+            
+            if not match:
+                logger.warning("Совпадений не найдено")
+                return
+
+            # Извлекаем имя пользователя и ссылку
+            groups = match.groups()
+            if groups[0] is not None:
+                username, amo_link = groups[0], groups[1]
+            else:
+                username, amo_link = groups[3], groups[2]
+
+            if await self.sheets.append_lead(self.user_tabs.get(username, "All"), 
+                                          [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                                           message.text, 
+                                           amo_link]):
+                sent_message = await message.reply_text(
+                    self.messages['lead_success'].format(username=username)
+                )
                 
-                if amo_link and username:
-                    if self.add_lead_to_sheet(username, message_text, amo_link):
-                        sent_message = await message.reply_text(
-                            f"📨 Лид передан для @{username}!\n\n"
-                            "❗️ Пожалуйста, подтвердите получение лида.(Можно написать в ответь 'ок', 'ok')"
-                        )
-                        
-                        lead_key = f"{chat_id}:{sent_message.message_id}"
-                        self.unconfirmed_leads[lead_key] = {
-                            "assigned_to": username,
-                            "amo_link": amo_link
-                        }
-                        
-                        # Сохраняем информацию об ожидании подтверждения
-                        self.waiting_confirmation[chat_id] = username
-                        
-                        # Запускаем таймер для отслеживания подтверждения
-                        self.lead_timers[lead_key] = asyncio.create_task(
-                            self.start_lead_timer(chat_id, sent_message.message_id, username)
-                        )
-                    else:
-                        await message.reply_text("❌ Ошибка при сохранении данных.")
+                lead_key = f"{message.chat_id}:{sent_message.message_id}"
+                self.unconfirmed_leads[lead_key] = {
+                    'assigned_to': username,
+                    'amo_link': amo_link
+                }
+                self.waiting_confirmation[message.chat_id] = username
+                self.lead_timers[lead_key] = asyncio.create_task(
+                    self.start_lead_timer(message.chat_id, sent_message.message_id, username)
+                )
+            else:
+                await message.reply_text(self.messages['error'])
 
         except Exception as e:
-            logger.error(f"Ошибка при обработке сообщения: {e}")
+            logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
+            await message.reply_text(self.messages['error'])
 
-    async def start_command(self, update: Update, context):
-        await update.message.reply_text(
-            "👋 Добро пожаловать!\n"
-            "Отправьте сообщение с упоминанием пользователя и ссылкой на сделку."
-        )
+    async def shutdown(self):
+        """Обработка завершения работы"""
+        for task in self.lead_timers.values():
+            task.cancel()
+        await asyncio.gather(*self.lead_timers.values(), return_exceptions=True)
 
     def run(self):
-        self.application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(MessageHandler(filters.TEXT, self.handle_message))
-        logger.info("🚀 Бот запущен...")
-        self.application.run_polling()
+        """Запуск бота с обработкой ошибок и логикой переподключения"""
+        # Инициализация event loop
+        try:
+            self.loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+
+        # Проверяем подключение к Google Sheets перед запуском
+        if not self.loop.run_until_complete(self.check_google_connection()):
+            logger.critical("Не удалось подключиться к Google Sheets. Выход.")
+            sys.exit(1)
+
+        # Создаем Flask приложение для поддержания работы
+        app = Flask(__name__)
+        
+        @app.route('/')
+        def keep_alive():
+            return "Bot is running!"
+        
+        def run_flask():
+            app.run(host='0.0.0.0', port=self.config.PORT)
+
+        # Запускаем Flask в отдельном потоке
+        Thread(target=run_flask, daemon=True).start()
+        
+        while True:
+            try:
+                self.application = ApplicationBuilder().token(self.config.TELEGRAM_BOT_TOKEN).build()
+                self.application.add_handler(CommandHandler("start", lambda u, c: self.start_command(u, c)))
+                self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+                self.application.add_error_handler(self.error_handler)
+                
+                # Регистрируем обработчик завершения
+                self.application.post_shutdown = self.shutdown
+                
+                # Запускаем бота с использованием существующего loop
+                self.application.run_polling(close_loop=False)
+            except Exception as e:
+                logger.error(f"Бот упал с ошибкой: {e}")
+                time.sleep(10)  # Ждем перед повторной попыткой
+
+    async def start_command(self, update: Update, context):
+        """Обработка команды /start"""
+        try:
+            # Тестируем подключение к Google Sheets
+            logger.info("Тестируем подключение к Google Sheets...")
+            test_result = await self.sheets.append_lead(
+                "All",  # Используем лист "All" для тестирования
+                ["TEST", "Test Message", "Test Link"]
+            )
+            if test_result:
+                logger.info("Успешно подключились к Google Sheets")
+            else:
+                logger.error("Не удалось подключиться к Google Sheets")
+        except Exception as e:
+            logger.error(f"Ошибка при тестировании Google Sheets: {e}")
+        
+        await update.message.reply_text(self.messages['start'])
+
+    async def error_handler(self, update: Update, context):
+        """Обработка ошибок"""
+        logger.error(f"Ошибка обработки обновления: {context.error}", exc_info=context.error)
 
 if __name__ == "__main__":
-    bot = LeadBot()
-    bot.run()
+    try:
+        config = Config()
+        sheets_manager = GoogleSheetsManager(config)
+        bot = LeadBot(config, sheets_manager)
+        bot.run()
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+        sys.exit(1)
