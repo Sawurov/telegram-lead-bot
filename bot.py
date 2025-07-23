@@ -127,6 +127,11 @@ class LeadBot:
                 logger.warning("Получено пустое сообщение")
                 return
 
+            # Игнорируем сообщения от бота уведомлений
+            if message.from_user and message.from_user.username == "billzsalesnotificationsbot":
+                logger.info("Игнорируем сообщение от @billzsalesnotificationsbot")
+                return
+
             # Поиск лида с улучшенным сопоставлением шаблонов
             match = re.search(r'(?:@(\w+).*?(https?://[^\s]+amocrm\.ru[^\s]*))|(?:(https?://[^\s]+amocrm\.ru[^\s]*).*?@(\w+))', message.text)
             
