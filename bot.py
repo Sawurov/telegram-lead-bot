@@ -159,7 +159,7 @@ class LeadBot:
             "mfarrux": "Бухара",
             "nasimjon_2014": "Бухара",
             "billzfergana": "Фергана",
-            "billzfergana": "okmurtazaev",
+            "billzfergana": "Фергана",
             "bobur_abdukahharov":"Ош",
             "sysadmin7777":"Кходжанд",
             "ravshan_billz": "All"
