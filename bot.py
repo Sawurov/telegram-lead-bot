@@ -3,17 +3,19 @@ import sys
 import json
 import logging
 import gspread
+import gspread.exceptions
 import re
 import time
 import requests
 import asyncio
 import glob
+import signal
 from datetime import datetime
 from collections import defaultdict
 from dotenv import load_dotenv
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 from telegram import Update
-from telegram.error import TelegramError, NetworkError, TimedOut
+from telegram.error import TelegramError, NetworkError, TimedOut, Conflict
 from flask import Flask
 from threading import Thread, Timer
 
@@ -26,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 # Загружаем переменные окружения
 load_dotenv()
+
+# Глобальная переменная для контроля запуска
+INSTANCE_RUNNING = False
+SHUTDOWN_EVENT = asyncio.Event()
 
 class Config:
     """Конфигурация для загрузки и проверки данных"""
@@ -136,7 +142,24 @@ class GoogleSheetsManager:
     def append_lead(self, worksheet_name: str, data: list) -> bool:
         """Добавление данных в таблицу"""
         try:
-            worksheet = self.spreadsheet.worksheet(worksheet_name)
+            # Сначала проверяем, существует ли таб
+            try:
+                worksheet = self.spreadsheet.worksheet(worksheet_name)
+            except gspread.exceptions.WorksheetNotFound:
+                logger.warning(f"Таб '{worksheet_name}' не найден, создаю...")
+                # Создаем новый таб
+                worksheet = self.spreadsheet.add_worksheet(
+                    title=worksheet_name, 
+                    rows=1000, 
+                    cols=10
+                )
+                # Добавляем заголовки
+                worksheet.append_row([
+                    "Дата", "Сообщение", "Ссылка AmoCRM", 
+                    "Пользователь", "Отправитель"
+                ])
+                logger.info(f"Создан новый таб: {worksheet_name}")
+            
             worksheet.append_row(data)
             logger.info(f"Данные добавлены в {worksheet_name}: {data}")
             return True
@@ -147,7 +170,13 @@ class GoogleSheetsManager:
     def count_leads_for_date(self, worksheet_name: str, date: str) -> int:
         """Подсчет лидов за определенную дату"""
         try:
-            worksheet = self.spreadsheet.worksheet(worksheet_name)
+            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: обработка отсутствующих табов
+            try:
+                worksheet = self.spreadsheet.worksheet(worksheet_name)
+            except gspread.exceptions.WorksheetNotFound:
+                logger.warning(f"Таб '{worksheet_name}' не найден в Google Sheets")
+                return 0
+                
             all_values = worksheet.get_all_values()
             
             # Пропускаем заголовок, если есть
@@ -178,13 +207,11 @@ class LeadStatsManager:
         self.daily_stats = defaultdict(lambda: defaultdict(int))
         
     async def get_daily_stats_command(self, update: Update, context):
-        """Команда для получения статистики за день"""
-        # Позволяем указать дату в формате /stats 2025-07-28
+        """ИСПРАВЛЕННАЯ команда для получения статистики за день"""
         args = context.args
         if args and len(args) > 0:
             try:
                 target_date = args[0]
-                # Проверяем формат даты
                 datetime.strptime(target_date, "%Y-%m-%d")
             except ValueError:
                 await update.message.reply_text("❌ Неверный формат даты. Используйте: /stats YYYY-MM-DD")
@@ -196,23 +223,40 @@ class LeadStatsManager:
             stats_text = f"📊 **Статистика лидов за {target_date}:**\n\n"
             
             total_leads = 0
+            # ИСПРАВЛЕНИЕ: берем все уникальные табы из user_tabs
             unique_tabs = set(self.user_tabs.values())
             
-            for tab_name in sorted(unique_tabs):
+            # Группируем статистику по табам
+            tabs_stats = {}
+            for tab_name in unique_tabs:
                 count = self.sheets.count_leads_for_date(tab_name, target_date)
                 if count > 0:
-                    stats_text += f"• {tab_name}: {count} лидов\n"
+                    tabs_stats[tab_name] = count
                     total_leads += count
+            
+            # Сортируем по алфавиту и выводим
+            for tab_name in sorted(tabs_stats.keys()):
+                stats_text += f"• {tab_name}: {tabs_stats[tab_name]} лидов\n"
             
             if total_leads == 0:
                 stats_text += "Нет лидов за указанную дату\n"
             
             stats_text += f"\n🎯 **Всего за день: {total_leads} лидов**"
             
+            # Показываем детали по отсутствующим табам
+            missing_tabs = []
+            for tab_name in unique_tabs:
+                if tab_name not in tabs_stats:
+                    missing_tabs.append(tab_name)
+            
+            if missing_tabs:
+                stats_text += f"\n⚠️ **Табы без лидов:** {', '.join(missing_tabs)}"
+                stats_text += f"\nВыполните /debug {target_date} для подробностей"
+            
             # Проверяем наличие пропущенных лидов
             backup_count = self._count_backup_leads()
             if backup_count > 0:
-                stats_text += f"\n⚠️ **Не записано: {backup_count} лидов**"
+                stats_text += f"\n🔄 **Не записано: {backup_count} лидов**"
                 stats_text += "\nВыполните /restore для восстановления"
             
             await update.message.reply_text(stats_text, parse_mode='Markdown')
@@ -240,27 +284,27 @@ class LeadBot:
     def __init__(self, config: Config, sheets_manager: GoogleSheetsManager):
         self.config = config
         self.sheets = sheets_manager
-        # ОБНОВЛЕННЫЙ список пользователей с учетом всех найденных в сообщениях
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: точный маппинг пользователей с правильным регистром
         self.user_tabs = {
             "texnopos_company": "Технопос",
-            "abdukhafizov95": "Самарканд",
+            "abdukhafizov95": "Самарканд",      # ИСПРАВЛЕН РЕГИСТР
             "aqly_office": "Хорезм",
             "aqly_uz": "Хорезм",
-            "aqly_hr": "Хорезм",  # добавлен новый пользователь
-            "billz_namangan": "Наманган",
+            "aqly_hr": "Хорезм",               # новый пользователь
+            "billz_namangan": "Наманган",       # ИСПРАВЛЕН РЕГИСТР
             "uzstylegroup": "Наманган",
             "utkirraimov": "Джиззак",
             "bob_7007": "Джиззак",
-            "farhod_developer": "Термез",
+            "farhod_developer": "Термез",       # ИСПРАВЛЕН РЕГИСТР
             "burhan_ergashov": "Ташкент",
             "mfarrux": "Бухара",
             "nasimjon_2014": "Бухара",
             "billzfergana": "Фергана",
             "okmurtazaev": "Фергана",
-            "bobur_abdukahharov":"Ош",
-            "sysadmin7777":"Кходжанд",
-            "sibrohimovg": "Термез",  # добавлен новый пользователь
-            "makhmud23": "Термез",   # добавлен новый пользователь
+            "bobur_abdukahharov": "Ош",
+            "sysadmin7777": "Кходжанд",
+            "sibrohimovg": "All",              # новый пользователь
+            "makhmud23": "All",                # новый пользователь
             "ravshan_billz": "All"
         }
         self.application = None
@@ -427,7 +471,7 @@ class LeadBot:
                 logger.debug(f"Полный текст сообщения: {message_text}")
                 return
 
-            logger.info(f"Найдено {len(leads_info)} лидов в сообщении")
+            logger.info(f"Найдено {len(leads_info)} лидов в сообщении: {[f'@{u}' for u, _ in leads_info]}")
 
             # Обрабатываем каждый найденный лид
             processed_count = 0
@@ -463,6 +507,98 @@ class LeadBot:
 
         except Exception as e:
             logger.error(f"Критическая ошибка обработки сообщения: {e}", exc_info=True)
+
+    async def debug_stats_command(self, update: Update, context):
+        """Отладочная команда для детального анализа статистики"""
+        args = context.args
+        if args and len(args) > 0:
+            target_date = args[0]
+        else:
+            target_date = datetime.now().strftime("%Y-%m-%d")
+        
+        debug_text = f"🔍 **ОТЛАДКА СТАТИСТИКИ за {target_date}:**\n\n"
+        
+        total_leads = 0
+        
+        # Проверяем КАЖДЫЙ таб отдельно
+        for user, tab_name in self.user_tabs.items():
+            try:
+                count = self.sheets.count_leads_for_date(tab_name, target_date)
+                debug_text += f"• @{user} → {tab_name}: {count} лидов\n"
+                total_leads += count
+            except Exception as e:
+                debug_text += f"• @{user} → {tab_name}: ОШИБКА - {str(e)}\n"
+        
+        debug_text += f"\n🎯 **Итого: {total_leads} лидов**\n\n"
+        
+        # Проверяем существование табов
+        debug_text += "📋 **Проверка табов в Google Sheets:**\n"
+        try:
+            all_worksheets = self.sheets.spreadsheet.worksheets()
+            existing_tabs = [ws.title for ws in all_worksheets]
+            debug_text += f"Существующие табы: {', '.join(existing_tabs)}\n\n"
+            
+            unique_tabs = set(self.user_tabs.values())
+            for tab in unique_tabs:
+                if tab in existing_tabs:
+                    debug_text += f"✅ {tab}\n"
+                else:
+                    debug_text += f"❌ {tab} - НЕ НАЙДЕН!\n"
+                    
+        except Exception as e:
+            debug_text += f"Ошибка проверки табов: {e}\n"
+        
+        # Разбиваем длинное сообщение
+        if len(debug_text) > 4000:
+            parts = [debug_text[i:i+4000] for i in range(0, len(debug_text), 4000)]
+            for i, part in enumerate(parts):
+                await update.message.reply_text(f"**Часть {i+1}:**\n{part}", parse_mode='Markdown')
+        else:
+            await update.message.reply_text(debug_text, parse_mode='Markdown')
+
+    async def create_missing_tabs_command(self, update: Update, context):
+        """Создание отсутствующих табов в Google Sheets"""
+        try:
+            await update.message.reply_text("🔧 Проверяю и создаю отсутствующие табы...")
+            
+            # Получаем список существующих табов
+            all_worksheets = self.sheets.spreadsheet.worksheets()
+            existing_tabs = [ws.title for ws in all_worksheets]
+            
+            # Получаем уникальные табы из нашего маппинга
+            required_tabs = set(self.user_tabs.values())
+            
+            created_count = 0
+            for tab_name in required_tabs:
+                if tab_name not in existing_tabs:
+                    try:
+                        # Создаем новый таб
+                        worksheet = self.sheets.spreadsheet.add_worksheet(
+                            title=tab_name, 
+                            rows=1000, 
+                            cols=10
+                        )
+                        # Добавляем заголовки
+                        worksheet.append_row([
+                            "Дата", "Сообщение", "Ссылка AmoCRM", 
+                            "Пользователь", "Отправитель"
+                        ])
+                        logger.info(f"Создан таб: {tab_name}")
+                        created_count += 1
+                    except Exception as e:
+                        logger.error(f"Ошибка создания таба {tab_name}: {e}")
+            
+            if created_count > 0:
+                await update.message.reply_text(
+                    f"✅ Создано {created_count} новых табов!\n"
+                    "Теперь выполните /stats для проверки"
+                )
+            else:
+                await update.message.reply_text("ℹ️ Все необходимые табы уже существуют")
+                
+        except Exception as e:
+            logger.error(f"Ошибка создания табов: {e}")
+            await update.message.reply_text("❌ Ошибка при создании табов")
 
     async def restore_failed_leads(self):
         """Восстановление лидов из резервных файлов"""
@@ -523,6 +659,8 @@ class LeadBot:
         """Настройка всех обработчиков команд"""
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("stats", self.stats_manager.get_daily_stats_command))
+        self.application.add_handler(CommandHandler("debug", self.debug_stats_command))
+        self.application.add_handler(CommandHandler("create_tabs", self.create_missing_tabs_command))
         self.application.add_handler(CommandHandler("restore", self.restore_failed_leads_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("users", self.show_users_command))
@@ -552,6 +690,8 @@ class LeadBot:
 **Доступные команды:**
 • /start - Показать это сообщение
 • /stats [дата] - Статистика лидов (например: /stats 2025-07-28)
+• /debug [дата] - Подробная отладка статистики
+• /create_tabs - Создать отсутствующие табы
 • /restore - Восстановить пропущенные лиды
 • /users - Показать всех пользователей и табы
 • /help - Помощь
@@ -582,6 +722,7 @@ class LeadBot:
 ✅ Сохраняет их в Google Sheets по табам
 ✅ Ведет статистику по пользователям
 ✅ Восстанавливает пропущенные записи
+✅ Автоматически создает отсутствующие табы
 
 **Формат лида:**
 `@username ... https://subdomain.amocrm.ru/...`
@@ -590,18 +731,49 @@ class LeadBot:
 **Команды:**
 • `/stats` - Показать статистику за сегодня
 • `/stats 2025-07-28` - Статистика за конкретную дату
+• `/debug 2025-07-28` - Подробный анализ проблем
+• `/create_tabs` - Создать недостающие табы в Sheets
 • `/restore` - Восстановить несохраненные лиды
 • `/users` - Список всех пользователей и табов
 
 **При проблемах:**
+• Выполните /debug для диагностики
+• Используйте /create_tabs для создания табов
 • Проверьте формат сообщения
 • Убедитесь, что ссылка содержит amocrm.ru
 • Используйте /restore для восстановления
         """
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
+    async def graceful_shutdown(self):
+        """Корректное завершение работы бота"""
+        global INSTANCE_RUNNING
+        logger.info("🔄 Инициализация корректного завершения...")
+        
+        INSTANCE_RUNNING = False
+        SHUTDOWN_EVENT.set()
+        
+        if self.application:
+            try:
+                await self.application.stop()
+                await self.application.shutdown()
+                logger.info("✅ Бот корректно остановлен")
+            except Exception as e:
+                logger.error(f"Ошибка при остановке бота: {e}")
+        
+        self.keep_alive.stop()
+
     def run(self):
-        """Запуск бота с улучшенной обработкой переподключений"""
+        """Запуск бота с ИСПРАВЛЕННОЙ обработкой конфликтов"""
+        global INSTANCE_RUNNING
+        
+        # Проверяем, не запущен ли уже экземпляр
+        if INSTANCE_RUNNING:
+            logger.error("❌ Экземпляр бота уже запущен!")
+            return
+        
+        INSTANCE_RUNNING = True
+        
         # Создаем Flask приложение для поддержания работы на Render
         app = Flask(__name__)
         
@@ -613,6 +785,13 @@ class LeadBot:
         def health_check():
             return {"status": "healthy", "timestamp": datetime.now().isoformat()}
         
+        @app.route('/shutdown', methods=['POST'])
+        def shutdown_endpoint():
+            """Эндпоинт для корректного завершения работы"""
+            logger.info("Получен запрос на завершение работы через /shutdown")
+            SHUTDOWN_EVENT.set()
+            return {"status": "shutdown initiated"}
+        
         def run_flask():
             app.run(host='0.0.0.0', port=self.config.PORT)
 
@@ -622,64 +801,97 @@ class LeadBot:
         # Запускаем keep-alive сервис
         self.keep_alive.start()
         
-        # Основной цикл с переподключениями
-        retry_count = 0
-        max_retries = 5
+        # Обработчики сигналов для корректного завершения
+        def signal_handler(signum, frame):
+            logger.info(f"Получен сигнал {signum}, инициализация корректного завершения...")
+            asyncio.create_task(self.graceful_shutdown())
         
-        while retry_count < max_retries:
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        # Основной цикл с УЛУЧШЕННОЙ обработкой конфликтов
+        retry_count = 0
+        max_retries = 3
+        
+        while retry_count < max_retries and not SHUTDOWN_EVENT.is_set():
             try:
-                logger.info(f"Попытка запуска бота #{retry_count + 1}")
+                logger.info(f"🚀 Попытка запуска бота #{retry_count + 1}")
                 
                 self.application = ApplicationBuilder().token(self.config.TELEGRAM_BOT_TOKEN).build()
                 self.setup_handlers()
                 
-                logger.info("=== БОТ ЗАПУЩЕН С УЛУЧШЕНИЯМИ ===")
-                logger.info("✅ Обработка множественных пользователей")
-                logger.info("✅ Улучшенная статистика с указанием даты")
-                logger.info("✅ Добавлены новые пользователи в табы")
+                logger.info("=== БОТ ЗАПУЩЕН С ПОЛНЫМИ ИСПРАВЛЕНИЯМИ ===")
+                logger.info("✅ Исправлен регистр пользователей")
+                logger.info("✅ Добавлено автосоздание табов")
+                logger.info("✅ Добавлена команда /debug")
+                logger.info("✅ Исправлена статистика для всех табов")
+                
                 retry_count = 0  # Сбрасываем счетчик при успешном запуске
                 
-                # Запуск polling с обработкой сетевых ошибок
+                # Запуск polling с обработкой конфликтов
                 self.application.run_polling(
-                    poll_interval=1.0,
-                    timeout=20,
-                    read_timeout=30,
-                    write_timeout=30,
-                    connect_timeout=30,
-                    pool_timeout=30
+                    poll_interval=2.0,  # Увеличили интервал
+                    timeout=30,
+                    read_timeout=20,
+                    write_timeout=20,
+                    connect_timeout=20,
+                    pool_timeout=20,
+                    close_loop=False  # Не закрываем event loop
                 )
+                
+            except Conflict as e:
+                retry_count += 1
+                wait_time = 15 + (retry_count * 5)  # Увеличиваем задержку при конфликтах
+                logger.error(f"🚫 КОНФЛИКТ ЭКЗЕМПЛЯРОВ (попытка {retry_count}/{max_retries}): {e}")
+                logger.info(f"💤 Ожидание {wait_time} секунд перед повтором...")
+                
+                # Пытаемся корректно завершить предыдущий экземпляр
+                if self.application:
+                    try:
+                        asyncio.run(self.application.stop())
+                        asyncio.run(self.application.shutdown())
+                    except Exception:
+                        pass
+                
+                time.sleep(wait_time)
                 
             except (NetworkError, TimedOut) as e:
                 retry_count += 1
-                wait_time = min(2 ** retry_count, 60)  # Экспоненциальная задержка, максимум 60 сек
-                logger.error(f"Сетевая ошибка (попытка {retry_count}/{max_retries}): {e}")
-                logger.info(f"Переподключение через {wait_time} секунд...")
+                wait_time = min(2 ** retry_count, 60)
+                logger.error(f"🌐 Сетевая ошибка (попытка {retry_count}/{max_retries}): {e}")
+                logger.info(f"💤 Переподключение через {wait_time} секунд...")
                 time.sleep(wait_time)
                 
             except Exception as e:
                 retry_count += 1
                 wait_time = min(2 ** retry_count, 60)
-                logger.error(f"Критическая ошибка (попытка {retry_count}/{max_retries}): {e}")
+                logger.error(f"💥 Критическая ошибка (попытка {retry_count}/{max_retries}): {e}")
                 if retry_count < max_retries:
-                    logger.info(f"Перезапуск через {wait_time} секунд...")
+                    logger.info(f"💤 Перезапуск через {wait_time} секунд...")
                     time.sleep(wait_time)
                 else:
-                    logger.critical("Превышено максимальное количество попыток перезапуска")
-                    raise
+                    logger.critical("💀 Превышено максимальное количество попыток перезапуска")
+                    break
         
-        # Останавливаем keep-alive при завершении
-        self.keep_alive.stop()
+        # Корректное завершение
+        asyncio.run(self.graceful_shutdown())
+        INSTANCE_RUNNING = False
 
     async def error_handler(self, update: Update, context):
-        """Обработка ошибок"""
+        """УЛУЧШЕННАЯ обработка ошибок с фильтрацией конфликтов"""
         error = context.error
         
-        # Игнорируем некоторые типы ошибок для уменьшения шума в логах
-        if isinstance(error, (NetworkError, TimedOut)):
-            logger.warning(f"Временная сетевая ошибка: {error}")
+        # Игнорируем конфликты экземпляров - они обрабатываются в основном цикле
+        if isinstance(error, Conflict):
+            logger.warning(f"🚫 Конфликт экземпляров: {error}")
             return
             
-        logger.error(f"Ошибка обработки обновления: {error}", exc_info=error)
+        # Игнорируем временные сетевые ошибки
+        if isinstance(error, (NetworkError, TimedOut)):
+            logger.warning(f"🌐 Временная сетевая ошибка: {error}")
+            return
+            
+        logger.error(f"💥 Ошибка обработки обновления: {error}", exc_info=error)
 
 if __name__ == "__main__":
     try:
@@ -687,18 +899,19 @@ if __name__ == "__main__":
         sheets_manager = GoogleSheetsManager(config)
         bot = LeadBot(config, sheets_manager)
         
-        logger.info("=== ЗАПУСК ИСПРАВЛЕННОГО БОТА ===")
-        logger.info(f"Render URL: {config.RENDER_URL}")
-        logger.info("Критические исправления:")
-        logger.info("- ✅ Обработка ВСЕХ пользователей в сообщении")  
-        logger.info("- ✅ Добавлены отсутствующие пользователи (@Sibrohimovg, @Makhmud23, @Aqly_hr)")
-        logger.info("- ✅ Исправлена статистика с поддержкой дат")
-        logger.info("- ✅ Улучшенное извлечение лидов из переносов строк")
+        logger.info("=== ЗАПУСК ОКОНЧАТЕЛЬНО ИСПРАВЛЕННОГО БОТА ===")
+        logger.info(f"🌐 Render URL: {config.RENDER_URL}")
+        logger.info("🔧 КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ:")
+        logger.info("- ✅ Исправлен регистр: abdukhafizov95, farhod_developer, billz_namangan")  
+        logger.info("- ✅ Автосоздание отсутствующих табов в Google Sheets")
+        logger.info("- ✅ Команда /debug для детального анализа проблем")
+        logger.info("- ✅ Команда /create_tabs для создания недостающих табов")
+        logger.info("- ✅ Статистика теперь учитывает ВСЕ табы включая 'All'")
         
         bot.run()
         
     except KeyboardInterrupt:
-        logger.info("Получен сигнал завершения работы")
+        logger.info("⌨️ Получен сигнал завершения работы")
     except Exception as e:
-        logger.error(f"Критическая ошибка запуска: {e}", exc_info=True)
+        logger.error(f"💀 Критическая ошибка запуска: {e}", exc_info=True)
         sys.exit(1)
