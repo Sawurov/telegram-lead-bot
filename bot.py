@@ -148,16 +148,22 @@ class GoogleSheetsManager:
         """Подсчет лидов за определенную дату"""
         try:
             worksheet = self.spreadsheet.worksheet(worksheet_name)
-            records = worksheet.get_all_records()
+            all_values = worksheet.get_all_values()
+            
+            # Пропускаем заголовок, если есть
+            if len(all_values) > 1:
+                data_rows = all_values[1:]
+            else:
+                data_rows = all_values
             
             count = 0
-            for record in records:
-                # Предполагаем, что первая колонка содержит дату
-                first_value = list(record.values())[0] if record else ""
-                record_date = str(first_value).split(' ')[0]
-                if record_date == date:
-                    count += 1
-                    
+            for row in data_rows:
+                if row and len(row) > 0:  # Проверяем, что строка не пустая
+                    # Предполагаем, что первая колонка содержит дату
+                    record_date = str(row[0]).split(' ')[0]  # Берем только дату без времени
+                    if record_date == date:
+                        count += 1
+                        
             return count
             
         except Exception as e:
@@ -173,19 +179,33 @@ class LeadStatsManager:
         
     async def get_daily_stats_command(self, update: Update, context):
         """Команда для получения статистики за день"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        # Позволяем указать дату в формате /stats 2025-07-28
+        args = context.args
+        if args and len(args) > 0:
+            try:
+                target_date = args[0]
+                # Проверяем формат даты
+                datetime.strptime(target_date, "%Y-%m-%d")
+            except ValueError:
+                await update.message.reply_text("❌ Неверный формат даты. Используйте: /stats YYYY-MM-DD")
+                return
+        else:
+            target_date = datetime.now().strftime("%Y-%m-%d")
         
         try:
-            stats_text = "📊 **Статистика лидов за сегодня:**\n\n"
+            stats_text = f"📊 **Статистика лидов за {target_date}:**\n\n"
             
             total_leads = 0
             unique_tabs = set(self.user_tabs.values())
             
-            for tab_name in unique_tabs:
-                count = self.sheets.count_leads_for_date(tab_name, today)
+            for tab_name in sorted(unique_tabs):
+                count = self.sheets.count_leads_for_date(tab_name, target_date)
                 if count > 0:
                     stats_text += f"• {tab_name}: {count} лидов\n"
                     total_leads += count
+            
+            if total_leads == 0:
+                stats_text += "Нет лидов за указанную дату\n"
             
             stats_text += f"\n🎯 **Всего за день: {total_leads} лидов**"
             
@@ -220,13 +240,14 @@ class LeadBot:
     def __init__(self, config: Config, sheets_manager: GoogleSheetsManager):
         self.config = config
         self.sheets = sheets_manager
+        # ОБНОВЛЕННЫЙ список пользователей с учетом всех найденных в сообщениях
         self.user_tabs = {
             "texnopos_company": "Технопос",
             "abdukhafizov95": "Самарканд",
             "aqly_office": "Хорезм",
             "aqly_uz": "Хорезм",
-            "aqly_hr": "Хорезм",
-            "billz_Namangan": "Наманган",
+            "aqly_hr": "Хорезм",  # добавлен новый пользователь
+            "billz_namangan": "Наманган",
             "uzstylegroup": "Наманган",
             "utkirraimov": "Джиззак",
             "bob_7007": "Джиззак",
@@ -238,6 +259,8 @@ class LeadBot:
             "okmurtazaev": "Фергана",
             "bobur_abdukahharov":"Ош",
             "sysadmin7777":"Кходжанд",
+            "sibrohimovg": "Термез",  # добавлен новый пользователь
+            "makhmud23": "Термез",   # добавлен новый пользователь
             "ravshan_billz": "All"
         }
         self.application = None
@@ -279,46 +302,40 @@ class LeadBot:
         else:
             return "unknown"
 
-    def _extract_lead_info(self, text):
-        """Улучшенное извлечение информации о лиде с множественными паттернами"""
+    def _extract_all_leads_info(self, text):
+        """НОВЫЙ МЕТОД: Извлечение ВСЕХ лидов из сообщения, включая множественные упоминания"""
         
-        # Различные паттерны для поиска лидов
-        patterns = [
-            # Основной паттерн: @username ... ссылка
-            r'@(\w+).*?(https?://[^\s]*amocrm\.ru[^\s]*)',
-            # Обратный порядок: ссылка ... @username  
-            r'(https?://[^\s]*amocrm\.ru[^\s]*).*?@(\w+)',
-            # Более гибкий поиск с разными доменами
-            r'@(\w+).*?(https?://.*?amocrm.*?)(?:\s|$)',
-            r'(https?://.*?amocrm.*?)(?:\s|$).*?@(\w+)',
-            # Поиск в начале строки
-            r'^@?(\w+).*?(https?://[^\s]*amocrm[^\s]*)',
-            # Поиск без @ в начале
-            r'(\w+).*?(https?://[^\s]*amocrm\.ru[^\s]*)',
-            # Еще более гибкий поиск
-            r'@(\w+)[^\n]*?(https?://[^\s]*amocrm[^\s]*)',
-        ]
+        # Сначала ищем ссылку AmoCRM
+        link_pattern = r'(https?://[^\s]*amocrm[^\s]*)'
+        link_match = re.search(link_pattern, text, re.IGNORECASE)
         
-        for i, pattern in enumerate(patterns):
-            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
-            if match:
-                groups = match.groups()
-                logger.debug(f"Паттерн {i+1} сработал: {groups}")
-                
-                if len(groups) == 2:
-                    # Определяем порядок: username, link или link, username
-                    if 'http' in groups[0]:
-                        username, link = groups[1], groups[0]
-                    else:
-                        username, link = groups[0], groups[1]
-                    
-                    # Проверяем, что username существует в наших табах или это валидный username
-                    if username and link and ('amocrm' in link.lower()):
-                        return username, link
+        if not link_match:
+            logger.debug("Ссылка AmoCRM не найдена")
+            return []
         
-        # Если ничего не найдено, логируем для анализа
-        logger.debug(f"Ни один паттерн не сработал для текста: {text[:200]}...")
-        return None, None
+        amo_link = link_match.group(1)
+        
+        # Теперь ищем ВСЕ упоминания пользователей в сообщении
+        username_pattern = r'@(\w+)'
+        username_matches = re.findall(username_pattern, text, re.IGNORECASE)
+        
+        if not username_matches:
+            logger.debug("Пользователи не найдены")
+            return []
+        
+        leads = []
+        for username in username_matches:
+            username_lower = username.lower()
+            # Проверяем, есть ли пользователь в наших табах
+            if username_lower in self.user_tabs:
+                leads.append((username_lower, amo_link))
+                logger.debug(f"Найден лид: {username_lower} -> {amo_link}")
+            else:
+                logger.warning(f"Пользователь @{username} не найден в табах, добавляем в 'All'")
+                # Добавляем неизвестного пользователя в таб "All"
+                leads.append((username_lower, amo_link))
+        
+        return leads
 
     async def _add_lead_with_retry(self, worksheet_name, data, max_retries=3):
         """Добавление лида с повторными попытками"""
@@ -369,7 +386,7 @@ class LeadBot:
             logger.error(f"Ошибка сохранения в резерв: {e}")
 
     async def handle_message(self, update: Update, context):
-        """Улучшенная обработка входящих сообщений с детальным логированием"""
+        """ОБНОВЛЕННАЯ обработка входящих сообщений с поддержкой множественных пользователей"""
         try:
             message = update.message
             
@@ -402,35 +419,47 @@ class LeadBot:
 
             logger.info(f"Обрабатываем сообщение от @{message.from_user.username if message.from_user else 'Unknown'}: {message_text[:100]}...")
 
-            # Улучшенный поиск лида с множественными паттернами
-            username, amo_link = self._extract_lead_info(message_text)
+            # НОВЫЙ ПОДХОД: Извлекаем ВСЕ лиды из сообщения
+            leads_info = self._extract_all_leads_info(message_text)
             
-            if not username or not amo_link:
-                logger.info(f"Лид не найден в сообщении. Username: {username}, Link: {bool(amo_link)}")
+            if not leads_info:
+                logger.info("Лиды не найдены в сообщении")
                 logger.debug(f"Полный текст сообщения: {message_text}")
                 return
 
-            # Определяем таб для пользователя
-            worksheet_name = self.user_tabs.get(username, "All")
-            
-            # Подготавливаем данные для записи
-            lead_data = [
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                message_text,
-                amo_link,
-                username,
-                message.from_user.username if message.from_user else "Unknown"
-            ]
-            
-            # Добавляем данные в Google Sheets с повторными попытками
-            success = await self._add_lead_with_retry(worksheet_name, lead_data)
-            
-            if success:
-                logger.info(f"✅ Лид успешно добавлен для @{username} в таб '{worksheet_name}'")
-            else:
-                logger.error(f"❌ Не удалось добавить лид для @{username} после всех попыток")
-                # Сохраняем в локальный буфер для повторной отправки
-                await self._save_to_backup(worksheet_name, lead_data)
+            logger.info(f"Найдено {len(leads_info)} лидов в сообщении")
+
+            # Обрабатываем каждый найденный лид
+            processed_count = 0
+            for username, amo_link in leads_info:
+                try:
+                    # Определяем таб для пользователя
+                    worksheet_name = self.user_tabs.get(username, "All")
+                    
+                    # Подготавливаем данные для записи
+                    lead_data = [
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        message_text,
+                        amo_link,
+                        username,
+                        message.from_user.username if message.from_user else "Unknown"
+                    ]
+                    
+                    # Добавляем данные в Google Sheets с повторными попытками
+                    success = await self._add_lead_with_retry(worksheet_name, lead_data)
+                    
+                    if success:
+                        logger.info(f"✅ Лид успешно добавлен для @{username} в таб '{worksheet_name}'")
+                        processed_count += 1
+                    else:
+                        logger.error(f"❌ Не удалось добавить лид для @{username} после всех попыток")
+                        # Сохраняем в локальный буфер для повторной отправки
+                        await self._save_to_backup(worksheet_name, lead_data)
+                        
+                except Exception as e:
+                    logger.error(f"Ошибка обработки лида для @{username}: {e}")
+
+            logger.info(f"Обработано лидов: {processed_count}/{len(leads_info)}")
 
         except Exception as e:
             logger.error(f"Критическая ошибка обработки сообщения: {e}", exc_info=True)
@@ -496,8 +525,24 @@ class LeadBot:
         self.application.add_handler(CommandHandler("stats", self.stats_manager.get_daily_stats_command))
         self.application.add_handler(CommandHandler("restore", self.restore_failed_leads_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("users", self.show_users_command))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.application.add_error_handler(self.error_handler)
+
+    async def show_users_command(self, update: Update, context):
+        """Команда для показа всех пользователей и их табов"""
+        users_text = "👥 **Список пользователей и их табов:**\n\n"
+        
+        # Группируем по табам
+        tabs_users = defaultdict(list)
+        for user, tab in self.user_tabs.items():
+            tabs_users[tab].append(f"@{user}")
+        
+        for tab_name in sorted(tabs_users.keys()):
+            users_list = ", ".join(sorted(tabs_users[tab_name]))
+            users_text += f"**{tab_name}:**\n{users_list}\n\n"
+        
+        await update.message.reply_text(users_text, parse_mode='Markdown')
 
     async def start_command(self, update: Update, context):
         """Обработка команды /start"""
@@ -506,8 +551,9 @@ class LeadBot:
 
 **Доступные команды:**
 • /start - Показать это сообщение
-• /stats - Статистика лидов за сегодня
+• /stats [дата] - Статистика лидов (например: /stats 2025-07-28)
 • /restore - Восстановить пропущенные лиды
+• /users - Показать всех пользователей и табы
 • /help - Помощь
 
 **Как работает бот:**
@@ -518,6 +564,10 @@ class LeadBot:
 • Сообщения с фото и подписью
 • Пересланные сообщения
 • Документы с подписью
+• **МНОЖЕСТВЕННЫЕ упоминания в одном сообщении**
+
+**Пример:** 
+`https://billz.amocrm.ru/leads/123 @user1 @user2`
         """
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -528,16 +578,20 @@ class LeadBot:
 
 **Что делает бот:**
 ✅ Автоматически находит лиды в сообщениях
+✅ Обрабатывает НЕСКОЛЬКО пользователей в одном сообщении  
 ✅ Сохраняет их в Google Sheets по табам
 ✅ Ведет статистику по пользователям
 ✅ Восстанавливает пропущенные записи
 
 **Формат лида:**
 `@username ... https://subdomain.amocrm.ru/...`
+`https://subdomain.amocrm.ru/... @user1 @user2`
 
 **Команды:**
-• `/stats` - Показать статистику за день
+• `/stats` - Показать статистику за сегодня
+• `/stats 2025-07-28` - Статистика за конкретную дату
 • `/restore` - Восстановить несохраненные лиды
+• `/users` - Список всех пользователей и табов
 
 **При проблемах:**
 • Проверьте формат сообщения
@@ -579,7 +633,10 @@ class LeadBot:
                 self.application = ApplicationBuilder().token(self.config.TELEGRAM_BOT_TOKEN).build()
                 self.setup_handlers()
                 
-                logger.info("Бот запущен успешно")
+                logger.info("=== БОТ ЗАПУЩЕН С УЛУЧШЕНИЯМИ ===")
+                logger.info("✅ Обработка множественных пользователей")
+                logger.info("✅ Улучшенная статистика с указанием даты")
+                logger.info("✅ Добавлены новые пользователи в табы")
                 retry_count = 0  # Сбрасываем счетчик при успешном запуске
                 
                 # Запуск polling с обработкой сетевых ошибок
@@ -630,14 +687,13 @@ if __name__ == "__main__":
         sheets_manager = GoogleSheetsManager(config)
         bot = LeadBot(config, sheets_manager)
         
-        logger.info("=== ЗАПУСК ОБНОВЛЕННОГО БОТА ===")
+        logger.info("=== ЗАПУСК ИСПРАВЛЕННОГО БОТА ===")
         logger.info(f"Render URL: {config.RENDER_URL}")
-        logger.info("Новые функции:")
-        logger.info("- Обработка всех типов сообщений (фото, документы, caption)")  
-        logger.info("- Улучшенные регулярные выражения для поиска лидов")
-        logger.info("- Резервное сохранение при сбоях")
-        logger.info("- Команды /stats и /restore")
-        logger.info("- Детальное логирование")
+        logger.info("Критические исправления:")
+        logger.info("- ✅ Обработка ВСЕХ пользователей в сообщении")  
+        logger.info("- ✅ Добавлены отсутствующие пользователи (@Sibrohimovg, @Makhmud23, @Aqly_hr)")
+        logger.info("- ✅ Исправлена статистика с поддержкой дат")
+        logger.info("- ✅ Улучшенное извлечение лидов из переносов строк")
         
         bot.run()
         
